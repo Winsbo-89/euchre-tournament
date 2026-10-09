@@ -93,6 +93,7 @@ func main() {
 	mux.HandleFunc("/admin/login", a.adminLogin)
 	mux.HandleFunc("/admin/logout", a.adminLogout)
 	mux.HandleFunc("/admin", a.admin)
+	mux.HandleFunc("/admin/replace-account", a.replaceAdminAccount)
 	mux.HandleFunc("/admin/tournament/create", a.createTournament)
 	mux.HandleFunc("/admin/tournament/start", a.startTournament)
 	mux.HandleFunc("/admin/tournament/reset", a.resetTournament)
@@ -287,6 +288,69 @@ func (a *App) admin(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, "admin.html", d)
 }
+func (a *App) replaceAdminAccount(w http.ResponseWriter, r *http.Request) {
+	s, ok := a.requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost || !a.validCSRF(r, s.csrf) {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	currentPassword := r.FormValue("current_password")
+	newUsername := strings.TrimSpace(r.FormValue("new_username"))
+	newPassword := r.FormValue("new_password")
+	confirmPassword := r.FormValue("confirm_password")
+	if len(newUsername) < 3 || len(newUsername) > 80 {
+		http.Error(w, "The new username must be between 3 and 80 characters. Return to the admin dashboard and try again.", http.StatusBadRequest)
+		return
+	}
+	if len(newPassword) < 8 || newPassword != confirmPassword {
+		http.Error(w, "The new passwords must match and be at least 8 characters long. Return to the admin dashboard and try again.", http.StatusBadRequest)
+		return
+	}
+
+	var currentHash string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT admin_password_hash FROM app_settings WHERE id=1`).Scan(&currentHash); err != nil {
+		http.Error(w, "Admin account could not be loaded.", http.StatusInternalServerError)
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(currentPassword)) != nil {
+		http.Error(w, "The current password was incorrect. Return to the admin dashboard and try again.", http.StatusUnauthorized)
+		return
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Could not update the admin account.", http.StatusInternalServerError)
+		return
+	}
+
+	// Update the one-and-only admin account and revoke every existing admin
+	// session in the same transaction. There is never a public registration window.
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, "Could not update the admin account.", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(r.Context(), `UPDATE app_settings SET admin_username=$1,admin_password_hash=$2 WHERE id=1`, newUsername, string(newHash)); err != nil {
+		http.Error(w, "Could not update the admin account. The new username may already be in use.", http.StatusBadRequest)
+		return
+	}
+	if _, err = tx.ExecContext(r.Context(), `DELETE FROM admin_sessions`); err != nil {
+		http.Error(w, "Could not revoke existing admin sessions.", http.StatusInternalServerError)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		http.Error(w, "Could not finish updating the admin account.", http.StatusInternalServerError)
+		return
+	}
+	clearCookie(w, "admin_session")
+	http.Redirect(w, r, "/admin/login", http.StatusSeeOther)
+}
+
 func (a *App) createTournament(w http.ResponseWriter, r *http.Request) {
 	s, ok := a.requireAdmin(w, r)
 	if !ok {
