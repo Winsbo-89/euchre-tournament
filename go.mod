@@ -1,4 +1,4 @@
-module https://github.com/Winsbo-89/euchre-tournament.git
+module github.com/Winsbo-89/euchre-tournament.git
 
 go 1.23
 
