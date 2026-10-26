@@ -20,5 +20,19 @@
 {{else}}
 <div class="card center"><h2>Waiting for your next game</h2><p>{{.SitoutMessage}}</p><p>Do not start a game at a table that is still playing. The app will show your next game once four players are assigned and the table is available.</p></div>
 {{end}}
-<script>setTimeout(()=>location.reload(),8000);</script>
+<script>
+// Keep live status updates, but never reload while a player is interacting
+// with a form or has entered values that have not yet been submitted.
+let formDirty = false;
+document.querySelectorAll('form').forEach(form => {
+  form.addEventListener('input', () => { formDirty = true; });
+  form.addEventListener('change', () => { formDirty = true; });
+});
+setInterval(() => {
+  const activeControl = document.activeElement &&
+    document.activeElement.matches('input, select, textarea');
+  if (formDirty || activeControl) return;
+  location.reload();
+}, 8000);
+</script>
 {{end}}
