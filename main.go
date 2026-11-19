@@ -88,6 +88,9 @@ type MatchView struct {
 	MyScore                         int
 	ScoreSubmitted, MyScoreAttested bool
 	ReviewMessage                   string
+	TieRequired, TieVoted           bool
+	TieVoteCount                    int
+	TieVoteMessage                  string
 }
 
 type Standing struct {
@@ -147,6 +150,7 @@ func main() {
 	mux.HandleFunc("/play/announcement", a.ackAnnouncement)
 	mux.HandleFunc("/play/ready", a.confirmReady)
 	mux.HandleFunc("/play/attest", a.attestScore)
+	mux.HandleFunc("/play/tie-result", a.submitTieResult)
 	mux.HandleFunc("/admin/tournament/reset", a.resetTournament)
 	mux.HandleFunc("/admin/correct-score", a.correctScore)
 	mux.HandleFunc("/admin/export.csv", a.exportCSV)
@@ -191,6 +195,9 @@ func initDB(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS leaderboard_locked BOOLEAN NOT NULL DEFAULT FALSE`,
 		`CREATE TABLE IF NOT EXISTS matches(id SERIAL PRIMARY KEY,tournament_id INTEGER NOT NULL REFERENCES tournaments(id) ON DELETE CASCADE,table_number INTEGER NOT NULL,game_number INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL CHECK(status IN ('waiting','active','review','completed')),a1 INTEGER NOT NULL REFERENCES players(id),b1 INTEGER NOT NULL REFERENCES players(id),a2 INTEGER NOT NULL REFERENCES players(id),b2 INTEGER NOT NULL REFERENCES players(id),winner_team INTEGER,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),started_at TIMESTAMPTZ,completed_at TIMESTAMPTZ)`,
 		`CREATE TABLE IF NOT EXISTS match_readiness(match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,announcement_ack BOOLEAN NOT NULL DEFAULT FALSE,ready BOOLEAN NOT NULL DEFAULT FALSE,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(match_id,player_id))`,
+		`ALTER TABLE matches ADD COLUMN IF NOT EXISTS tie_required BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE matches ADD COLUMN IF NOT EXISTS tie_winner_team INTEGER`,
+		`CREATE TABLE IF NOT EXISTS match_tie_votes(match_id INTEGER NOT NULL REFERENCES matches(id) ON DELETE CASCADE,player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,team_won BOOLEAN NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(match_id,player_id))`,
 		`CREATE INDEX IF NOT EXISTS idx_matches_table_status ON matches(tournament_id,table_number,status)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_match_per_table ON matches(tournament_id,table_number) WHERE status IN ('waiting','active','review')`,
 	}
@@ -1210,6 +1217,73 @@ func (a *App) attestScore(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/play", 303)
 }
 
+func (a *App) submitTieResult(w http.ResponseWriter, r *http.Request) {
+	token, ok := cookieValue(r, "player_session")
+	if !ok {
+		http.Redirect(w, r, "/play", 303)
+		return
+	}
+	ps, err := a.playerSession(r.Context(), token)
+	if err != nil {
+		http.Redirect(w, r, "/play", 303)
+		return
+	}
+	if r.Method != http.MethodPost || !a.validCSRF(r, ps.csrf) {
+		http.Error(w, "invalid request", 400)
+		return
+	}
+	mid, _ := strconv.Atoi(r.FormValue("match_id"))
+	answer := r.FormValue("team_won")
+	if answer != "yes" && answer != "no" {
+		http.Error(w, "Choose whether your team won.", 400)
+		return
+	}
+	var a1, b1, a2, b2 int
+	var status string
+	err = a.db.QueryRowContext(r.Context(), `SELECT a1,b1,a2,b2,status,tie_required FROM matches WHERE id=$1 AND tournament_id=$2`, mid, ps.tournamentID).Scan(&a1, &b1, &a2, &b2, &status, &tieRequired)
+	if err != nil || status != "review" || !tieRequired {
+		http.Error(w, "This game is not awaiting a tie decision.", 409)
+		return
+	}
+	team := 0
+	if ps.playerID == a1 || ps.playerID == b1 {
+		team = 1
+	}
+	if ps.playerID == a2 || ps.playerID == b2 {
+		team = 2
+	}
+	if team == 0 {
+		http.Error(w, "You are not part of this game.", 403)
+		return
+	}
+	won := answer == "yes"
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO match_tie_votes(match_id,player_id,team_won) VALUES($1,$2,$3) ON CONFLICT(match_id,player_id) DO UPDATE SET team_won=EXCLUDED.team_won,updated_at=NOW()`, mid, ps.playerID, won)
+	if err != nil {
+		http.Error(w, "Could not save your tie decision.", 500)
+		return
+	}
+	var yes1, no1, yes2, no2 int
+	_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FILTER (WHERE player_id IN ($2,$3) AND team_won),COUNT(*) FILTER (WHERE player_id IN ($2,$3) AND NOT team_won),COUNT(*) FILTER (WHERE player_id IN ($4,$5) AND team_won),COUNT(*) FILTER (WHERE player_id IN ($4,$5) AND NOT team_won) FROM match_tie_votes WHERE match_id=$1`, mid, a1, b1, a2, b2).Scan(&yes1, &no1, &yes2, &no2)
+	winner := 0
+	if yes1 == 2 && no2 == 2 {
+		winner = 1
+	}
+	if yes2 == 2 && no1 == 2 {
+		winner = 2
+	}
+	if winner != 0 {
+		_, err = a.db.ExecContext(r.Context(), `UPDATE matches SET tie_winner_team=$1 WHERE id=$2 AND tie_required=TRUE`, winner, mid)
+		if err == nil {
+			err = a.evaluateMatch(r.Context(), mid)
+		}
+		if err != nil {
+			http.Error(w, "Could not finalize tied game: "+err.Error(), 500)
+			return
+		}
+	}
+	http.Redirect(w, r, "/play", 303)
+}
+
 func (a *App) createNextMatches(ctx context.Context, tid, maxTables int) error {
 	for table := 1; table <= maxTables; table++ {
 		var pending int
@@ -1368,7 +1442,8 @@ func (a *App) choosePairing(ctx context.Context, tid int, aa, bb []int) (int, in
 func (a *App) evaluateMatch(ctx context.Context, mid int) error {
 	var tid, table, a1, b1, a2, b2 int
 	var status string
-	if err := a.db.QueryRowContext(ctx, `SELECT tournament_id,table_number,a1,b1,a2,b2,status FROM matches WHERE id=$1`, mid).Scan(&tid, &table, &a1, &b1, &a2, &b2, &status); err != nil {
+	var tieWinner sql.NullInt64
+	if err := a.db.QueryRowContext(ctx, `SELECT tournament_id,table_number,a1,b1,a2,b2,status,tie_winner_team FROM matches WHERE id=$1`, mid).Scan(&tid, &table, &a1, &b1, &a2, &b2, &status, &tieWinner); err != nil {
 		return err
 	}
 	if status != "active" && status != "review" {
@@ -1401,26 +1476,32 @@ func (a *App) evaluateMatch(ctx context.Context, mid int) error {
 	for _, v := range vals {
 		score[v.id] = v.score
 	}
-	// User-requested validation: the four scores must form two matching pairs,
-	// without requiring the pair-matching check itself to infer team identity.
 	pairScores := []int{score[a1], score[b1], score[a2], score[b2]}
 	sort.Ints(pairScores)
-	if pairScores[0] != pairScores[1] || pairScores[2] != pairScores[3] || pairScores[0] == pairScores[2] {
-		_, err = a.db.ExecContext(ctx, `UPDATE matches SET status='review' WHERE id=$1`, mid)
+	allEqual := pairScores[0] == pairScores[3]
+	winner := 0
+	if tieWinner.Valid && (tieWinner.Int64 == 1 || tieWinner.Int64 == 2) {
+		winner = int(tieWinner.Int64)
+	} else if allEqual {
+		_, err = a.db.ExecContext(ctx, `UPDATE matches SET status='review',tie_required=TRUE WHERE id=$1`, mid)
 		return err
-	}
-	// The recorded lineup is still needed to determine the winner. If matching
-	// score pairs cross the two actual teams, the team totals can tie; that
-	// cannot safely be auto-resolved and is sent to the admin.
-	team1Score := score[a1] + score[b1]
-	team2Score := score[a2] + score[b2]
-	if team1Score == team2Score {
-		_, err = a.db.ExecContext(ctx, `UPDATE matches SET status='review' WHERE id=$1`, mid)
-		return err
-	}
-	winner := 1
-	if team2Score > team1Score {
-		winner = 2
+	} else {
+		// Normal games require two matching score pairs. Their actual team totals
+		// determine the winner; identical totals require the tie-break prompt.
+		if pairScores[0] != pairScores[1] || pairScores[2] != pairScores[3] || pairScores[0] == pairScores[2] {
+			_, err = a.db.ExecContext(ctx, `UPDATE matches SET status='review',tie_required=FALSE WHERE id=$1`, mid)
+			return err
+		}
+		team1Score := score[a1] + score[b1]
+		team2Score := score[a2] + score[b2]
+		if team1Score == team2Score {
+			_, err = a.db.ExecContext(ctx, `UPDATE matches SET status='review',tie_required=TRUE WHERE id=$1`, mid)
+			return err
+		}
+		winner = 1
+		if team2Score > team1Score {
+			winner = 2
+		}
 	}
 	var maxTables int
 	var playerCount int
@@ -1630,6 +1711,12 @@ func (a *App) renderPlay(w http.ResponseWriter, r *http.Request, t *Tournament, 
 	err = a.db.QueryRowContext(r.Context(), `SELECT id,table_number,status,a1,b1,a2,b2 FROM matches WHERE tournament_id=$1 AND status IN ('waiting','active','review') AND $2 IN (a1,b1,a2,b2) ORDER BY id DESC LIMIT 1`, t.ID, pid).Scan(&mv.ID, &mv.Table, &mv.Status, new(int), new(int), new(int), new(int))
 	// Load the match IDs separately; using a stable row struct avoids changing the fixed lineup after start.
 	if err == nil {
+		_ = a.db.QueryRowContext(r.Context(), `SELECT tie_required FROM matches WHERE id=$1`, mv.ID).Scan(&mv.TieRequired)
+		if mv.TieRequired {
+			_ = a.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM match_tie_votes WHERE match_id=$1`, mv.ID).Scan(&mv.TieVoteCount)
+			_ = a.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM match_tie_votes WHERE match_id=$1 AND player_id=$2)`, mv.ID, pid).Scan(&mv.TieVoted)
+			mv.TieVoteMessage = "The scores are tied. Each player must confirm whether their own team won. Both teammates must agree, and the opposing team must confirm they lost."
+		}
 		var a1, b1, a2, b2 int
 		_ = a.db.QueryRowContext(r.Context(), `SELECT a1,b1,a2,b2 FROM matches WHERE id=$1`, mv.ID).Scan(&a1, &b1, &a2, &b2)
 		var players []MatchPlayerView
@@ -1694,8 +1781,8 @@ func (a *App) renderPlay(w http.ResponseWriter, r *http.Request, t *Tournament, 
 				mv.Opponents = append(mv.Opponents, x)
 			}
 		}
-		if mv.Status == "review" {
-			mv.ReviewMessage = "The four scores must form two matching pairs, and the recorded teams must have different totals. The admin must review or correct the scores."
+		if mv.Status == "review" && !mv.TieRequired {
+			mv.ReviewMessage = "The four scores must form two matching pairs. The admin must review or correct the scores."
 		}
 		data["Match"] = &mv
 	} else {
