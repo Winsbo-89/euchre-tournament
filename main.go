@@ -1240,6 +1240,7 @@ func (a *App) submitTieResult(w http.ResponseWriter, r *http.Request) {
 	}
 	var a1, b1, a2, b2 int
 	var status string
+	var tieRequired bool
 	err = a.db.QueryRowContext(r.Context(), `SELECT a1,b1,a2,b2,status,tie_required FROM matches WHERE id=$1 AND tournament_id=$2`, mid, ps.tournamentID).Scan(&a1, &b1, &a2, &b2, &status, &tieRequired)
 	if err != nil || status != "review" || !tieRequired {
 		http.Error(w, "This game is not awaiting a tie decision.", 409)
